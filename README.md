@@ -2,12 +2,13 @@
 
 A single-file, zero-dependency bridge that lets other machines on your LAN
 render with [Blender](https://www.blender.org/) on your Mac — using its GPU
-(Metal) — while *you* keep physical control over every line of code that
-executes.
+(Metal) — including remote template management, with a token as the single
+trust anchor.
 
 Typical setup: an AI assistant (or any HTTP client) on your network sends a
 **render job made of pure parameters**, your Mac renders it headless with
-Blender + Metal, and the resulting MP4/PNG is downloaded over HTTP.
+Blender + Metal, and the resulting MP4/PNG is downloaded over HTTP. Templates
+(scene recipes) can also be pushed, updated and versioned remotely.
 
 ```
 +----------------+     POST /render {template, params}     +----------------+
@@ -28,8 +29,8 @@ with **standard library only** — no pip installs.
 ## Features
 
 - **One file, zero dependencies** — `bridge.py` uses only the Python standard library
-- **Pure-parameter jobs** — the network never carries code; values are validated and clamped server-side
-- **Human-in-the-loop template approval** — new/updated templates arrive as a *pending* file with a visible diff in the console; only a keypress on the machine activates them
+- **Pure-parameter jobs** — render requests carry only values (numbers, booleans, closed enumerations), clamped server-side by the template
+- **Remote template management** — push, update and remove templates over HTTP: syntax check, atomic write, automatic backups, SHA-256 fingerprints
 - **Template integrity checks** — `/health` publishes a SHA-256 fingerprint per template so clients can verify what the Mac is running
 - **Job lifecycle** — `queued → running → done|error`, Blender runs as a subprocess (a crash never takes the bridge down)
 - **Remote cancel** — `/cancel` SIGTERMs (then SIGKILLs) the running render
@@ -109,12 +110,12 @@ print(post("/render", {"template": "backrooms",
 
 | Method | Route | Auth | Description |
 |---|---|---|---|
-| GET | `/health` | — | Version, Blender path, template list, SHA-256 per template, busy flag, pending template name |
-| POST | `/render` | token | `{template, params}` → `202 {job_id}` · `409` if a render is running or the template has a pending version |
+| GET | `/health` | — | Version, Blender path, template list, SHA-256 per template, busy flag |
+| POST | `/render` | token | `{template, params}` → `202 {job_id}` · `409` if a render is already running |
 | GET | `/jobs/{id}` | — | State (`queued`/`running`/`done`/`error`), error message, last 25 log lines |
 | GET | `/jobs/{id}/file` | — | The rendered artifact (`video/mp4` or `image/png`) |
 | POST | `/cancel` | token | Stops the running render (SIGTERM → SIGKILL) · `404` if idle |
-| POST | `/template` | token | `{name, code}` — installs **nothing**; creates `<name>.py.pending` and asks the human |
+| POST | `/template` | token | `{name, code}` — validates, backs up the old version and activates the template immediately |
 
 Auth = `X-Bridge-Token` header, compared in constant time.
 
@@ -122,12 +123,11 @@ Auth = `X-Bridge-Token` header, compared in constant time.
 
 ```json
 {
-  "bridge": "blender-bridge/1.4",
+  "bridge": "blender-bridge/1.5",
   "blender": "/opt/homebrew/bin/blender",
   "templates": ["backrooms"],
   "template_hashes": {"backrooms": "06b3e2c0cf90fc00"},
-  "busy": false,
-  "pending_approval": null
+  "busy": false
 }
 ```
 
@@ -135,51 +135,38 @@ Auth = `X-Bridge-Token` header, compared in constant time.
 
 ## Security model
 
-The design goal: **let a remote assistant drive Blender without giving it code
-execution on your machine.**
+The design goal: **give a remote assistant a single, audited capability —
+driving Blender — instead of a shell.** Trust is anchored on one secret: the
+token.
 
-**What the network can do**
+**What the token holder can do**
 
 - Submit render jobs whose `params` are plain values (numbers, booleans, strings
   from closed enumerations). The template clamps them to safe ranges
   (e.g. `seconds` 1–30, `width` 320–3840) regardless of what was sent.
+- Push new templates or update existing ones. Each push is:
+  - **name-validated** (`a-z_` only, no traversal) and **size-capped**
+  - **syntax-checked** with Python's own `ast.parse` (rejected with the failing line number)
+  - **written atomically** (`.tmp` + rename, so a half-written template can never run)
+  - **backed up automatically** (`templates/_backups/`, 5 most recent kept per template)
+  - **logged visibly** in the bridge console
+  - **activated immediately** — this is trust-the-token by design
 - Cancel the running render.
-- Submit template *candidates* — which stay inert until approved locally (below).
+- Verify what's deployed: `/health` publishes a fingerprint of every template.
 
-**What the network can never do**
+**What nobody without the token can do**
 
-- Execute code directly. Jobs are data; the only Python ever executed lives in
-  `templates/*.py`, files you control.
-- Approve a pending template. The approval prompt is answered by a **keypress
-  in the bridge console** — there is deliberately no HTTP route for it. The
-  bridge even warns and disables approval entirely when started without a TTY.
-- Read arbitrary files or touch anything outside the bridge folder.
+- Anything. Every mutating route returns `403` without a valid token
+  (compared in constant time, immune to timing attacks).
 
-**Template approval flow (the core of the model)**
-
-```
-POST /template {name, code}
-        │  syntax-checked (ast.parse), name validated, size capped
-        ▼
-templates/<name>.py.pending        ← inert, cannot be rendered
-        │  console shows a unified diff + prompt
-        ▼
-human types 'o'  ──────────────►  <name>.py activated (old version
-human types 'n'  ──────────────►  pending file deleted, nothing changed
-                                   backed up to templates/_backups/)
-```
-
-While anything is pending, `/render` refuses that template (`409`), so a
-pending file can never sneak into a job.
-
-**Honest caveat** — a template, once approved, is Python running inside
-Blender (an unsandboxed CPython). That is exactly why activation requires a
-physical keypress on your machine: *the network proposes, the human disposes.*
-Read the diff. Only approve code you've skimmed, from a source you trust.
+**Honest caveat** — a template is Python running inside Blender (an unsandboxed
+CPython). That is by design here: whoever holds the token controls the
+templates, so **treat the token like a shell on the machine**. Keep it private,
+rotate it freely (delete `.token` and restart), and don't run the bridge on an
+untrusted network segment.
 
 **Other properties**
 
-- Token is required for every mutating route (`403` otherwise), compared with `hmac.compare_digest`
 - One render at a time; `/cancel` terminates the Blender subprocess cleanly
 - Body size capped at 64 KB; all output stays under `out/`
 - LAN-only by design — don't port-forward it
@@ -217,12 +204,30 @@ are generated procedurally, no texture files needed.
 | `engine` | `cycles`/`eevee` | `cycles` | Eevee requires a display/GPU context |
 | `denoise` | bool | `true` | OpenImageDenoise |
 
+### Pushing a template
+
+```bash
+python3 - << 'EOF'
+import json, urllib.request
+
+code = open("mytemplate.py").read()
+req = urllib.request.Request(
+    "http://<mac-ip>:8777/template",
+    data=json.dumps({"name": "mytemplate", "code": code}).encode(),
+    headers={"Content-Type": "application/json", "X-Bridge-Token": "TOKEN"})
+print(urllib.request.urlopen(req).read())
+EOF
+```
+
+Invalid Python is rejected up front with the failing line number; valid
+templates are backed up and live instantly.
+
 ### Writing your own
 
 1. Copy the `backrooms.py` structure: read `argv` after `--`, clamp inputs,
    build a scene, write into the output directory.
 2. Test locally: `blender -b --factory-startup -P mytemplate.py -- params.json out`
-3. Drop it in `templates/` (or POST it and approve in the console).
+3. Push it (above) or drop it in `templates/`.
 
 ---
 
@@ -266,8 +271,8 @@ Rules of thumb:
 | `Blender not found` | `brew install --cask blender`, then restart the bridge |
 | `403 invalid token` | Token mismatch — copy it from the bridge console |
 | `409 a render is already running` | Wait, or `POST /cancel` |
-| Console shows approval prompt but you're remote | Approving requires the console — that's the security model |
 | Renders are dark / lights missing | Check `out/<job>/blender.log`; verify GPU detection line (`GPU: METAL` etc.) |
+| `Failed to denoise` in the log | Your Blender build lacks OpenImageDenoise — send `"denoise": false` |
 | MP4 won't open after a killed render | Expected — H.264 index is written at the end; re-render |
 | `height not divisible by 2` error | Use even dimensions (the shipped template rounds for you) |
 | Port already in use | Change `PORT` at the top of `bridge.py` |
@@ -278,12 +283,12 @@ Rules of thumb:
 
 **Why not just SSH and run Blender?**
 You can — but then the remote side has a shell on your Mac. This bridge
-exposes exactly one capability (parameterized renders) with a human gate on
-code, which is a much smaller attack surface.
+exposes exactly one capability (parameterized renders + template management)
+with every action logged, which is a much smaller and more auditable surface.
 
 **Why does the client pick templates by name instead of sending a script?**
-Because a script *is* code. Sending a template *name* keeps the wire format
-data-only; actual code changes go through the local approval flow.
+Render jobs stay data-only that way. Code changes go through the dedicated
+`/template` route where they're validated, backed up and fingerprinted.
 
 **Can I run multiple renders in parallel?**
 Not built-in — the bridge refuses with `409` while busy. Run a second bridge

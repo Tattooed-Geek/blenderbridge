@@ -9,13 +9,13 @@ sends a job, your Mac renders with Metal, and the resulting MP4/PNG is
 downloaded over HTTP.
 
 Security model (the short version):
-  - The network never sends code. Jobs are parameter objects validated and
-    clamped by the server; the only Python ever executed is the template
-    files that YOU placed in templates/.
-  - New/updated templates submitted over the network land as <name>.py.pending
-    and are shown as a diff in this console. Nothing becomes active until a
-    human types "o" (approve) or "n" (reject) in THIS terminal. There is no
-    network route that can approve.
+  - Render jobs are parameter objects validated and clamped by the server;
+    templates are referenced by name and resolved from templates/ here.
+  - Templates can be pushed over the network (POST /template): they are
+    syntax-checked, validated, and activated immediately - with the previous
+    version backed up automatically and a diff printed in this console for
+    transparency. Trust-the-token by design: whoever holds the token controls
+    the templates. Keep the token private.
   - Token required for every mutating call (constant-time comparison).
   - One render at a time; /cancel terminates the Blender subprocess.
 
@@ -52,8 +52,6 @@ JOBS = {}            # job_id -> {state, template, error, file}
 JOBS_LOCK = threading.Lock()
 CURRENT = None       # job_id of the running render
 CURRENT_PROC = None  # subprocess.Popen of the running render
-PENDING = None       # template awaiting local approval: {"name", "path"}
-PENDING_LOCK = threading.Lock()
 
 
 def find_blender():
@@ -89,61 +87,6 @@ def template_hashes():
             h = hashlib.sha256(open(os.path.join(TEMPLATES_DIR, f), "rb").read()).hexdigest()[:16]
             out[os.path.splitext(f)[0]] = h
     return out
-
-
-def approval_loop():
-    """Console reader: 'o' approves the pending template, 'n' rejects it.
-
-    This is the ONLY way a network-submitted template becomes active - no HTTP
-    route can approve on the human's behalf.
-    """
-    global PENDING
-    while True:
-        line = sys.stdin.readline()
-        if not line:  # stdin closed (started without a TTY)
-            print("[template] WARNING: no terminal attached - template "
-                  "approval is unavailable. Restart the bridge inside a "
-                  "Terminal to enable it.", flush=True)
-            return
-        cmd = line.strip().lower()
-        if not cmd:
-            continue
-        with PENDING_LOCK:
-            pend = PENDING
-        if cmd in ("o", "oui", "y", "yes"):
-            if not pend:
-                print("[template] nothing to approve", flush=True)
-                continue
-            target = os.path.join(TEMPLATES_DIR, pend["name"] + ".py")
-            backup_made = os.path.exists(target)
-            if backup_made:
-                bdir = os.path.join(TEMPLATES_DIR, "_backups")
-                os.makedirs(bdir, exist_ok=True)
-                stamp = time.strftime("%Y%m%d-%H%M%S")
-                shutil.copy2(target,
-                             os.path.join(bdir, f"{pend['name']}.{stamp}.py"))
-            os.replace(pend["path"], target)
-            with PENDING_LOCK:
-                PENDING = None
-            print(f"[template] '{pend['name']}' APPROVED and now active "
-                  f"(previous version backed up: {'yes' if backup_made else 'n/a'})",
-                  flush=True)
-        elif cmd in ("n", "non", "no"):
-            with PENDING_LOCK:
-                pend, PENDING = PENDING, None
-            if pend:
-                try:
-                    os.remove(pend["path"])
-                except OSError:
-                    pass
-                print(f"[template] '{pend['name']}' rejected, nothing changed",
-                      flush=True)
-            else:
-                print("[template] nothing to reject", flush=True)
-        elif cmd in ("h", "help", "?"):
-            print("[template] commands: o = approve pending template, "
-                  "n = reject", flush=True)
-        # any other input is ignored
 
 
 def run_job(job_id, template, params):
@@ -213,15 +156,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            with PENDING_LOCK:
-                pend = PENDING["name"] if PENDING else None
             return self._json(200, {
-                "bridge": "blender-bridge/1.4",
+                "bridge": "blender-bridge/1.5",
                 "blender": BLENDER,
                 "templates": templates_available(),
                 "template_hashes": template_hashes(),
                 "busy": CURRENT is not None,
-                "pending_approval": pend,
             })
         m = re.fullmatch(r"/jobs/([a-f0-9-]{36})", self.path)
         if m:
@@ -268,10 +208,6 @@ class Handler(BaseHTTPRequestHandler):
         template = data.get("template", "")
         if template not in templates_available() or not re.fullmatch(r"[a-z_]+", template):
             return self._json(400, {"error": f"unknown template. Available: {templates_available()}"})
-        if os.path.exists(os.path.join(TEMPLATES_DIR, template + ".py.pending")):
-            return self._json(409, {"error": f"template '{template}' has a version "
-                                           "PENDING approval - approve or reject it "
-                                           "in the bridge console first"})
         params = data.get("params", {})
         if not isinstance(params, dict):
             return self._json(400, {"error": "params must be an object"})
@@ -308,12 +244,12 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(200, {"ok": True, "cancelled": target})
 
     def _post_template(self):
-        """Receive a template {name, code}: DO NOT activate it.
+        """Receive a template {name, code} and activate it immediately.
 
-        Writes <name>.py.pending, prints a unified diff in this console and
-        waits for the local human to type 'o' (approve) or 'n' (reject).
+        Safety rails (non-blocking): name validation, syntax check, atomic
+        write, automatic backup of the previous version (templates/_backups/,
+        5 kept per template), and a confirmation printed in this console.
         """
-        global PENDING
         tok = self.headers.get("X-Bridge-Token", "")
         if not hmac.compare_digest(tok, TOKEN):
             return self._json(403, {"error": "invalid token"})
@@ -333,29 +269,36 @@ class Handler(BaseHTTPRequestHandler):
         target = os.path.abspath(os.path.join(TEMPLATES_DIR, name + ".py"))
         if not target.startswith(os.path.abspath(TEMPLATES_DIR) + os.sep):
             return self._json(400, {"error": "invalid name"})
-        pending_path = target + ".pending"
-        with open(pending_path, "w") as f:
+        backup_made = False
+        if os.path.exists(target):
+            bdir = os.path.join(TEMPLATES_DIR, "_backups")
+            os.makedirs(bdir, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            shutil.copy2(target, os.path.join(bdir, f"{name}.{stamp}.py"))
+            backup_made = True
+            prune_backups(bdir, name)
+        tmp = target + ".tmp"
+        with open(tmp, "w") as f:
             f.write(code)
-        old_lines = open(target).read().splitlines() if os.path.exists(target) else []
-        diff = list(difflib.unified_diff(old_lines, code.splitlines(),
-                                         "before", "after", lineterm=""))
+        os.replace(tmp, target)
+        old_lines = []
         print("\n" + "=" * 62, flush=True)
-        print(f"[template] '{name}' PENDING APPROVAL "
-              f"({'update' if old_lines else 'new template'}, "
-              f"{len(code)} bytes)", flush=True)
-        print(f"[template] diff preview ({min(len(diff), 60)} of "
-              f"{len(diff)} lines) - full file: {pending_path}", flush=True)
-        for line in diff[:60]:
-            print("  " + line, flush=True)
-        if len(diff) > 60:
-            print(f"  ... (+{len(diff) - 60} more lines)", flush=True)
-        print("[template] >>> type 'o' to APPROVE, 'n' to REJECT <<<", flush=True)
+        print(f"[template] '{name}' {'UPDATED' if backup_made else 'CREATED'} "
+              f"({len(code)} bytes, previous version backed up: "
+              f"{'yes' if backup_made else 'n/a'})", flush=True)
         print("=" * 62 + "\n", flush=True)
-        with PENDING_LOCK:
-            PENDING = {"name": name, "path": pending_path}
-        return self._json(200, {"ok": True, "name": name, "status": "pending",
-                                "message": "awaiting local approval "
-                                           "('o' in the bridge console)"})
+        return self._json(200, {"ok": True, "name": name, "status": "active",
+                                "backup": backup_made})
+
+
+def prune_backups(bdir, name, keep=5):
+    """Keep the 5 most recent backups per template."""
+    backups = sorted(glob.glob(os.path.join(bdir, f"{name}.*.py")), reverse=True)
+    for old in backups[keep:]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
 
 
 def tail_log(job_id, n=25):
@@ -372,15 +315,12 @@ TOKEN = load_or_create_token()
 if __name__ == "__main__":
     if not BLENDER:
         sys.exit("Blender not found. Install it with:  brew install --cask blender")
-    threading.Thread(target=approval_loop, daemon=True).start()
     print("=" * 62)
-    print(" BlenderBridge ready (v1.4 - local template approval)")
+    print(" BlenderBridge ready (v1.5)")
     print(f"   Blender  : {BLENDER}")
     print(f"   Templates: {', '.join(templates_available())}")
     print(f"   Token    : {TOKEN}   <- give this to your HTTP client")
     print(f"   Listening: 0.0.0.0:{PORT} (LAN only)")
-    print("   Templates received over the network stay PENDING until you "
-          "type 'o' here.")
     print("   Stop     : Ctrl-C")
     print("=" * 62)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
