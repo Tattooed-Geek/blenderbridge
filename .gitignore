@@ -1,0 +1,8 @@
+# Local runtime artifacts
+.token
+out/
+templates/_backups/
+templates/*.pending
+__pycache__/
+*.pyc
+.DS_Store
